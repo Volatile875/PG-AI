@@ -30,6 +30,9 @@ COUNT_KEYWORDS = [
     "total",
     "record count",
     "rows count",
+    "show me the data",
+    "list",
+    "give me the data",
 ]
 
 ROLE_CONFIG = {
@@ -43,6 +46,158 @@ DATE_TYPES = {
     "timestamp without time zone",
     "timestamp with time zone",
 }
+
+TABLE_SCHEMA_HINTS = {
+    "sediment_ngdr_backup": [
+        "state_name",
+        "district_name",
+        "toposheet",
+        "silicon_dioxide",
+        "aluminium_oxide",
+        "ferric_oxide",
+        "titanium_dioxide",
+        "calcium_oxide",
+        "magnesium_oxide",
+        "mangnese_oxide",
+        "sodium_oxide",
+        "potassium_oxide",
+        "phosphorus_pentoxide",
+        "loss_on_ignition",
+        "barium",
+        "gallium",
+        "scandium",
+        "vanadium",
+        "thorium",
+        "lead",
+        "nickel",
+        "cobalt",
+        "rubidium",
+        "strontium",
+        "yttrium",
+        "zirconium",
+        "noibium",
+        "chromium",
+        "copper",
+        "zinc",
+        "gold",
+        "lithium",
+        "cesium",
+        "arsenic",
+        "antimony",
+        "bismuth",
+        "selenium",
+        "silver",
+        "cadmium",
+        "mercury",
+        "beryllium",
+        "germanium",
+        "molybdenum",
+        "tin",
+        "lanthanum",
+        "cerium",
+        "praseodymium",
+        "neodymium",
+        "samarium",
+        "europium",
+        "terbium",
+        "dysprosium",
+        "holmium",
+        "erbium",
+        "thulium",
+        "ytterbium",
+        "lutetium",
+        "hafnium",
+        "tantalum",
+        "tungsten",
+        "uranium",
+        "plantium",
+        "palladium",
+        "indium",
+        "flourin",
+        "tellurium",
+        "thallium",
+    ],
+    "exploration_data_backup": [
+        "id_0",
+        "geom",
+        "exid",
+        "id",
+        "gid",
+        "subid",
+        "commodity",
+        "exploaration_accession_number",
+        "project_title",
+        "toposheet",
+        "name_of_exploration_agency",
+        "exploration_search_keyword",
+        "period_of_prospecting_form",
+        "period_of_prospecting_to",
+        "exp_upid",
+        "exploration_stage",
+        "mobile_number",
+        "name_of_the_prospector",
+        "osm_no",
+        "scale",
+        "toposheet_type",
+        "username",
+        "explorat_3",
+        "non_georef",
+        "explorat_4",
+        "explorat_5",
+        "georeferen",
+        "exp_rep_do",
+        "state_name",
+        "state_code",
+        "district_code",
+        "district_name",
+        "block_number",
+        "geographic",
+        "exp_dd_lon",
+        "exp_dd_lat",
+        "exp_dms_la",
+        "exp_dms_lo",
+        "row_number",
+        "block_name",
+        "tehsil_name",
+        "village_name",
+    ],
+    "gravity_ngdr_backup": [
+        "state_name",
+        "district_name",
+        "elevation",
+        "observed_gravity",
+        "theoritic_anomaly",
+        "bouguer_anomaly",
+        "soi_name",
+        "soi_status",
+    ],
+    "magnetic_ngdr_backup": [
+        "state_name",
+        "district_name",
+        "observed_magnetic",
+        "igrf",
+        "magnetic_anomaly",
+        "soi",
+        "soi_status",
+    ],
+}
+
+PREFERRED_JOIN_KEYS = [
+    "state_name",
+    "state_code",
+    "district_name",
+    "district_code",
+    "block_name",
+    "block_number",
+    "tehsil_name",
+    "village_name",
+    "toposheet",
+    "soi_name",
+    "soi",
+    "soi_status",
+    "gid",
+    "id",
+]
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
@@ -128,11 +283,98 @@ def enforce_limit(sql_query: str, effective_limit: int) -> str:
     return f"{sql_query} LIMIT {effective_limit}"
 
 
+def extract_tables_from_sql(sql_query: str) -> list[str]:
+    lowered = sql_query.lower()
+    return list(dict.fromkeys(re.findall(r"(?:from|join)\s+(?:public\.)?([a-zA-Z_][a-zA-Z0-9_]*)", lowered)))
+
+
+def extract_simple_where_conditions(sql_query: str) -> list[dict[str, Any]]:
+    match = re.search(
+        r"\bwhere\b(.+?)(?:\border\s+by\b|\bgroup\s+by\b|\blimit\b|\boffset\b|$)",
+        sql_query,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return []
+
+    where_part = match.group(1)
+    chunks = re.split(r"\s+and\s+", where_part, flags=re.IGNORECASE)
+    conditions: list[dict[str, Any]] = []
+
+    pattern = re.compile(
+        r"(?:(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*))\s*(=|>=|<=|>|<)\s*(?:'([^']*)'|(-?\d+(?:\.\d+)?))",
+        flags=re.IGNORECASE,
+    )
+    for raw in chunks:
+        piece = raw.strip().strip("()")
+        cond = pattern.fullmatch(piece)
+        if not cond:
+            continue
+
+        col = cond.group(1)
+        op = cond.group(2)
+        str_val = cond.group(3)
+        num_val = cond.group(4)
+        value: Any = str_val if str_val is not None else (float(num_val) if "." in num_val else int(num_val))
+        conditions.append({"column": col, "op": op, "value": value})
+
+    return conditions
+
+
+def resolve_text_filter_value(table_name: str, column_name: str, raw_value: str) -> str:
+    candidates = get_distinct_values(table_name, column_name)
+    if not candidates:
+        return raw_value
+
+    raw_norm = normalize_text(raw_value)
+    for candidate in candidates:
+        if normalize_text(candidate) == raw_norm:
+            return candidate
+
+    best = raw_value
+    best_score = 0.0
+    for candidate in candidates:
+        score = SequenceMatcher(None, raw_norm, normalize_text(candidate)).ratio()
+        if score > best_score:
+            best_score = score
+            best = candidate
+
+    # Correct near-miss spellings (e.g., Chhattisghar -> Chhattisgarh).
+    if best_score >= 0.72:
+        return best
+    return raw_value
+
+
+def normalize_conditions_for_table(table_name: str, conditions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    schema = get_table_schema().get(table_name, {})
+    normalized: list[dict[str, Any]] = []
+    corrections: list[dict[str, str]] = []
+
+    for cond in conditions:
+        col = str(cond.get("column", ""))
+        op = str(cond.get("op", "="))
+        value = cond.get("value")
+
+        if col not in schema:
+            continue
+
+        next_value = value
+        if isinstance(value, str) and op == "=":
+            resolved = resolve_text_filter_value(table_name, col, value)
+            if resolved != value:
+                corrections.append({"column": col, "from": value, "to": resolved})
+            next_value = resolved
+
+        normalized.append({"column": col, "op": op, "value": next_value})
+
+    return normalized, corrections
+
+
 def generate_sql_with_ollama(
     prompt: str, active_tables: list[str], role_name: str, effective_limit: int
 ) -> dict[str, Any]:
     schema = get_table_schema()
-    schema_view = {t: list(schema.get(t, {}).keys()) for t in active_tables}
+    schema_view = get_schema_view_for_tables(active_tables, schema)
     role_cap = ROLE_CONFIG[role_name]["max_limit"]
 
     prompt_text = (
@@ -211,6 +453,22 @@ def get_table_metadata() -> dict[str, list[str]]:
     return {table: list(columns.keys()) for table, columns in schema.items()}
 
 
+def get_schema_view_for_tables(
+    table_names: list[str], schema: dict[str, dict[str, str]] | None = None
+) -> dict[str, list[str]]:
+    schema = schema or get_table_schema()
+    schema_view: dict[str, list[str]] = {}
+    for table in table_names:
+        actual_columns = list(schema.get(table, {}).keys())
+        hinted_columns = TABLE_SCHEMA_HINTS.get(table)
+        if hinted_columns:
+            filtered_columns = [col for col in hinted_columns if col in schema.get(table, {})]
+            schema_view[table] = filtered_columns or actual_columns
+        else:
+            schema_view[table] = actual_columns
+    return schema_view
+
+
 def configured_allowed_tables(all_tables: list[str]) -> list[str]:
     env_value = os.getenv("APP_ALLOWED_TABLES", "").strip()
     if env_value:
@@ -218,6 +476,9 @@ def configured_allowed_tables(all_tables: list[str]) -> list[str]:
         valid = [t for t in requested if t in all_tables]
         if valid:
             return valid[:MAX_TABLES]
+    hinted = [table for table in TABLE_SCHEMA_HINTS if table in all_tables]
+    if hinted:
+        return hinted[:MAX_TABLES]
     return all_tables[:MAX_TABLES]
 
 
@@ -234,12 +495,13 @@ def choose_active_tables(selected_tables: list[str] | None, role: str) -> list[s
         raise HTTPException(status_code=500, detail="No public tables found in database")
 
     default_allowed = configured_allowed_tables(table_names)
+    allowed_set = set(default_allowed)
     role_max_tables = ROLE_CONFIG[role]["max_tables"]
 
     if not selected_tables:
         return default_allowed[:role_max_tables]
 
-    valid_selected = [t for t in selected_tables if t in table_names]
+    valid_selected = [t for t in selected_tables if t in allowed_set]
     if not valid_selected:
         return default_allowed[:role_max_tables]
 
@@ -272,8 +534,11 @@ def score_table_match(prompt: str, table_name: str) -> float:
     table_tokens = table_norm.split("_")
     token_hits = sum(1 for token in table_tokens if token in prompt_norm)
     token_score = token_hits / max(1, len(table_tokens))
+    hinted_columns = TABLE_SCHEMA_HINTS.get(table_name, [])
+    column_hits = sum(1 for col in hinted_columns if normalize_text(col) in prompt_norm)
+    column_score = column_hits / max(1, len(hinted_columns)) if hinted_columns else 0.0
     fuzzy_score = SequenceMatcher(None, prompt_norm, table_norm).ratio()
-    return max(token_score, fuzzy_score)
+    return max(token_score, column_score, fuzzy_score)
 
 
 def detect_target_tables(prompt: str, active_tables: list[str]) -> list[str]:
@@ -540,6 +805,124 @@ def fetch_count(table_name: str, table_filters: dict[str, Any]) -> int:
             return int(result["total_records"])
 
 
+def fetch_rows_with_conditions(table_name: str, limit: int, conditions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    schema = get_table_schema().get(table_name, {})
+    allowed_ops = {">", "<", ">=", "<=", "="}
+    where_parts: list[sql.SQL] = []
+    params: list[Any] = []
+
+    for cond in conditions:
+        col = str(cond.get("column", ""))
+        op = str(cond.get("op", "="))
+        if col not in schema or op not in allowed_ops:
+            continue
+        value = cond.get("value")
+        if isinstance(value, str) and op == "=":
+            where_parts.append(sql.SQL("LOWER({}) = LOWER(%s)").format(sql.Identifier(col)))
+            params.append(value)
+        else:
+            where_parts.append(sql.SQL("{} {} %s").format(sql.Identifier(col), sql.SQL(op)))
+            params.append(value)
+
+    query = sql.SQL("SELECT * FROM public.{}").format(sql.Identifier(table_name))
+    if where_parts:
+        query = query + sql.SQL(" WHERE ") + sql.SQL(" AND ").join(where_parts)
+    query = query + sql.SQL(" LIMIT %s;")
+    params.append(limit)
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            return cur.fetchall()
+
+
+def find_join_columns(left_table: str, right_table: str, schema: dict[str, dict[str, str]]) -> list[str]:
+    left_cols = set(schema.get(left_table, {}).keys())
+    right_cols = set(schema.get(right_table, {}).keys())
+    common = left_cols & right_cols
+    if not common:
+        return []
+
+    preferred = [col for col in PREFERRED_JOIN_KEYS if col in common]
+    if preferred:
+        return preferred
+
+    id_like = sorted(col for col in common if col.endswith("_id") or col == "id")
+    if id_like:
+        return id_like
+
+    return []
+
+
+def fetch_joined_rows(table_names: list[str], limit: int) -> list[dict[str, Any]]:
+    if not table_names:
+        return []
+
+    schema = get_table_schema()
+    aliases = {table: f"t{idx + 1}" for idx, table in enumerate(table_names)}
+    selected_tables = [table_names[0]]
+    from_clause = sql.SQL("FROM public.{} AS {}").format(
+        sql.Identifier(table_names[0]),
+        sql.Identifier(aliases[table_names[0]]),
+    )
+
+    for table in table_names[1:]:
+        right_alias = aliases[table]
+
+        anchor_table = None
+        join_cols: list[str] = []
+        for candidate in selected_tables:
+            candidate_cols = find_join_columns(candidate, table, schema)
+            if candidate_cols:
+                anchor_table = candidate
+                join_cols = candidate_cols
+                break
+
+        if not anchor_table or not join_cols:
+            continue
+
+        left_alias = aliases[anchor_table]
+        on_parts = [
+            sql.SQL("{}.{} = {}.{}").format(
+                sql.Identifier(left_alias),
+                sql.Identifier(col),
+                sql.Identifier(right_alias),
+                sql.Identifier(col),
+            )
+            for col in join_cols
+        ]
+
+        from_clause = (
+            from_clause
+            + sql.SQL(" LEFT JOIN public.{} AS {} ON ").format(
+                sql.Identifier(table),
+                sql.Identifier(right_alias),
+            )
+            + sql.SQL(" AND ").join(on_parts)
+        )
+        selected_tables.append(table)
+
+    select_items: list[sql.SQL] = []
+    for table in selected_tables:
+        alias = aliases[table]
+        for col in schema.get(table, {}).keys():
+            select_items.append(
+                sql.SQL("{}.{} AS {}").format(
+                    sql.Identifier(alias),
+                    sql.Identifier(col),
+                    sql.Identifier(f"{table}__{col}"),
+                )
+            )
+
+    query = sql.SQL("SELECT {} ").format(sql.SQL(", ").join(select_items)) + from_clause
+    query = query + sql.SQL(" LIMIT %s;")
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, (limit,))
+            return cur.fetchall()
+
+
 def ensure_audit_table():
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -627,8 +1010,8 @@ def table_metadata():
         "model_reference": get_model_reference(),
         "llm_ready": ready,
         "llm_error": err,
-        "columns": {table: list(schema[table].keys()) for table in allowed},
-        "message": "Set APP_ALLOWED_TABLES=table1,table2,table3,table4 to lock exact tables.",
+        "columns": get_schema_view_for_tables(allowed, schema),
+        "message": "Retrieval is constrained to the configured tables and their schema hints.",
     }
 
 
@@ -691,7 +1074,72 @@ def query_data(req: PromptRequest):
             tables_for_log = llm_plan["tables"]
             parsed_filters = {"source": "ollama"}
 
+            llm_sql_tables = extract_tables_from_sql(llm_plan["sql"])
+            llm_conditions = extract_simple_where_conditions(llm_plan["sql"])
+
             row_count = len(llm_rows)
+            if intent != "count_records" and len(active_tables) > 1 and len(llm_sql_tables) < len(active_tables):
+                broadcast_results: dict[str, list[dict[str, Any]]] = {}
+                condition_corrections: dict[str, list[dict[str, str]]] = {}
+                total_rows = 0
+                for table in active_tables:
+                    table_conditions, corrections = normalize_conditions_for_table(table, llm_conditions)
+                    condition_corrections[table] = corrections
+                    rows = fetch_rows_with_conditions(table, effective_limit, table_conditions)
+                    broadcast_results[table] = rows
+                    total_rows += len(rows)
+
+                tables_for_log = active_tables
+                parsed_filters = {
+                    "source": "ollama_broadcast",
+                    "sql_tables": llm_sql_tables,
+                    "sql_conditions": llm_conditions,
+                    "condition_corrections": condition_corrections,
+                }
+                write_audit_log(
+                    user_id=req.user_id,
+                    role_name=role_name,
+                    prompt=req.prompt,
+                    intent=intent,
+                    tables=tables_for_log,
+                    filters_payload=parsed_filters,
+                    requested_limit=req.limit,
+                    effective_limit=effective_limit,
+                    result_row_count=total_rows,
+                    status="success",
+                )
+
+                return {
+                    "intent": intent,
+                    "tables": active_tables,
+                    "parsed": {
+                        "role": role_name,
+                        "requested_limit": req.limit,
+                        "effective_limit": effective_limit,
+                        "count": False,
+                        "filters": parsed_filters,
+                        "sql": llm_plan["sql"],
+                        "llm_confidence": llm_plan.get("confidence"),
+                        "model_reference": get_model_reference(),
+                    },
+                    "results": broadcast_results,
+                }
+
+            if intent != "count_records" and row_count == 0 and len(llm_sql_tables) == 1 and llm_conditions:
+                target_table = llm_sql_tables[0]
+                if target_table in active_tables:
+                    corrected_conditions, corrections = normalize_conditions_for_table(target_table, llm_conditions)
+                    corrected_rows = fetch_rows_with_conditions(target_table, effective_limit, corrected_conditions)
+                    if corrected_rows:
+                        llm_rows = corrected_rows
+                        row_count = len(llm_rows)
+                        parsed_filters = {
+                            "source": "ollama_autocorrect",
+                            "sql_tables": llm_sql_tables,
+                            "sql_conditions": llm_conditions,
+                            "condition_corrections": {target_table: corrections},
+                        }
+
             write_audit_log(
                 user_id=req.user_id,
                 role_name=role_name,
@@ -836,6 +1284,36 @@ def query_data(req: PromptRequest):
                 "results": {state_table: rows},
             }
 
+        if len(detected_tables) > 1:
+            joined_rows = fetch_joined_rows(detected_tables, effective_limit)
+            tables_for_log = detected_tables
+            write_audit_log(
+                user_id=req.user_id,
+                role_name=role_name,
+                prompt=req.prompt,
+                intent=intent,
+                tables=tables_for_log,
+                filters_payload=parsed_filters,
+                requested_limit=req.limit,
+                effective_limit=effective_limit,
+                result_row_count=len(joined_rows),
+                status="success",
+            )
+
+            return {
+                "intent": intent,
+                "tables": ["joined_result"],
+                "parsed": {
+                    "role": role_name,
+                    "requested_limit": req.limit,
+                    "effective_limit": effective_limit,
+                    "count": False,
+                    "filters": parsed_filters,
+                    "joined_tables": detected_tables,
+                },
+                "results": {"joined_result": joined_rows},
+            }
+
         results: dict[str, list[dict[str, Any]]] = {}
         total_rows = 0
         for table in detected_tables:
@@ -909,7 +1387,7 @@ def fetch_all_data():
         tables = choose_active_tables([], "viewer")
         if not tables:
             raise HTTPException(status_code=500, detail="No tables configured")
-        return fetch_rows(table_name=tables[0], limit=50, table_filters={})
+        return fetch_joined_rows(table_names=tables, limit=50)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
